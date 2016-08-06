@@ -361,6 +361,8 @@ struct msm_fb_data_type {
 	struct mutex switch_lock;
 	struct input_handler *input_handler;
 	int first_frame;
+
+	u32 unblank_bl_level;
 };
 
 static inline void mdss_fb_update_notify_update(struct msm_fb_data_type *mfd)
