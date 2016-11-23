@@ -295,6 +295,10 @@ struct synaptics_ts_data {
 	char fw_name[TP_FW_NAME_MAX_LEN];
 	char fw_id[12];
 	char manu_name[12];
+
+	struct work_struct pm_work;
+
+	bool stop_keypad;
 };
 
 static int tc_hw_pwron(struct synaptics_ts_data *ts)
@@ -844,7 +848,7 @@ static void synaptics_ts_report(struct synaptics_ts_data *ts )
         else
             int_key(ts);
 #else
-        if (!virtual_key_enable) {
+        if (!virtual_key_enable && !ts->stop_keypad) {
             int_key(ts);
         }
 #endif
@@ -1775,6 +1779,18 @@ static void synaptics_hard_reset(struct synaptics_ts_data *ts)
     }
 
 }
+
+static void synaptics_suspend_resume(struct work_struct *work)
+{
+	struct synaptics_ts_data *ts =
+		container_of(work, typeof(*ts), pm_work);
+
+	if (ts->suspended)
+		synaptics_ts_suspend(&ts->client->dev);
+	else
+		synaptics_ts_resume(&ts->client->dev);
+}
+
 static int synaptics_parse_dts(struct device *dev, struct synaptics_ts_data *ts)
 {
 	int rc;
@@ -1872,6 +1888,80 @@ err_pinctrl_get:
 	return retval;
 }
 
+bool s1302_is_keypad_stopped(void)
+{
+	struct synaptics_ts_data *ts = tc_g;
+
+	return ts->stop_keypad;
+}
+
+static void synaptics_input_event(struct input_handle *handle,
+		unsigned int type, unsigned int code, int value)
+{
+	struct synaptics_ts_data *ts = tc_g;
+
+	if (code != BTN_TOOL_FINGER)
+		return;
+
+	/* Disable capacitive keys when user's finger is on touchscreen */
+	ts->stop_keypad = value;
+}
+
+static int synaptics_input_connect(struct input_handler *handler,
+		struct input_dev *dev, const struct input_device_id *id)
+{
+	struct input_handle *handle;
+	int ret;
+
+	handle = kzalloc(sizeof(*handle), GFP_KERNEL);
+	if (!handle)
+		return -ENOMEM;
+
+	handle->dev = dev;
+	handle->handler = handler;
+	handle->name = "s1302_handle";
+
+	ret = input_register_handle(handle);
+	if (ret)
+		goto err2;
+
+	ret = input_open_device(handle);
+	if (ret)
+		goto err1;
+
+	return 0;
+
+err1:
+	input_unregister_handle(handle);
+err2:
+	kfree(handle);
+	return ret;
+}
+
+static void synaptics_input_disconnect(struct input_handle *handle)
+{
+	input_close_device(handle);
+	input_unregister_handle(handle);
+	kfree(handle);
+}
+
+static const struct input_device_id synaptics_input_ids[] = {
+	{
+		.flags = INPUT_DEVICE_ID_MATCH_KEYBIT,
+		.keybit = { [BIT_WORD(BTN_TOOL_FINGER)] =
+				BIT_MASK(BTN_TOOL_FINGER) },
+	},
+	{ },
+};
+
+static struct input_handler synaptics_input_handler = {
+	.event		= synaptics_input_event,
+	.connect	= synaptics_input_connect,
+	.disconnect	= synaptics_input_disconnect,
+	.name		= "syna_input_handler",
+	.id_table	= synaptics_input_ids,
+};
+
 static int synaptics_ts_probe(struct i2c_client *client, const struct i2c_device_id *id)
 {
 #ifdef CONFIG_SYNAPTIC_RED
@@ -1956,6 +2046,9 @@ static int synaptics_ts_probe(struct i2c_client *client, const struct i2c_device
 	if(ret < 0) {
 		TPD_ERR("synaptics_input_init failed!\n");
 	}
+
+	INIT_WORK(&ts->pm_work, synaptics_suspend_resume);
+
 #if defined(CONFIG_FB)
 	ts->suspended = 0;
 	ts->fb_notif.notifier_call = fb_notifier_callback;
@@ -2004,6 +2097,11 @@ static int synaptics_ts_probe(struct i2c_client *client, const struct i2c_device
 		register_remote_device_s1302(premote_data);
     }
 #endif
+
+	ret = input_register_handler(&synaptics_input_handler);
+	if (ret)
+		TPD_ERR("%s: Failed to register input handler\n", __func__);
+
 	TPDTM_DMESG("synaptics_ts_probe s1302: normal end\n");
 	return 0;
 
@@ -2107,30 +2205,30 @@ ERR_RESUME:
 #if defined(CONFIG_FB)
 static int fb_notifier_callback(struct notifier_block *self, unsigned long event, void *data)
 {
+	struct synaptics_ts_data *ts =
+		container_of(self, struct synaptics_ts_data, fb_notif);
 	struct fb_event *evdata = data;
-	int *blank;
+	int *blank = evdata->data;
 
-	struct synaptics_ts_data *ts = container_of(self, struct synaptics_ts_data, fb_notif);
+	if (event != FB_EVENT_BLANK)
+		return NOTIFY_OK;
 
-	if(FB_EVENT_BLANK != event)
-	return 0;
-	if((evdata) && (evdata->data) && (ts) && (ts->client)&&(event == FB_EVENT_BLANK)) {
-		blank = evdata->data;
-		if( *blank == FB_BLANK_UNBLANK || *blank == FB_BLANK_NORMAL) {
-			TPD_DEBUG("%s going TP resume\n", __func__);
-			if(ts->suspended == 1){
-				ts->suspended = 0;
-				synaptics_ts_resume(&ts->client->dev);
-			}
-		} else if( *blank == FB_BLANK_POWERDOWN) {
-			TPD_DEBUG("%s : going TP suspend\n", __func__);
-			if(ts->suspended == 0) {
-				ts->suspended = 1;
-				synaptics_ts_suspend(&ts->client->dev);
-			}
+	switch (*blank) {
+	case FB_BLANK_UNBLANK:
+	case FB_BLANK_NORMAL:
+		if (ts->suspended) {
+			ts->suspended = 0;
+			queue_work(system_highpri_wq, &ts->pm_work);
+		}
+		break;
+	case FB_BLANK_POWERDOWN:
+		if (!ts->suspended) {
+			ts->suspended = 1;
+			queue_work(system_highpri_wq, &ts->pm_work);
 		}
 	}
-	return 0;
+
+	return NOTIFY_OK;
 }
 #endif
 
