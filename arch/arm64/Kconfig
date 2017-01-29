@@ -323,6 +323,12 @@ source "drivers/pci/hotplug/Kconfig"
 endmenu
 
 menu "Kernel Features"
+config CGGROUPS
+        default y
+config LBDAF
+        default y
+config WATCHDOG_NOWAYOUT
+        default y
 
 menu "ARM errata workarounds via the alternatives framework"
 
